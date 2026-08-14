@@ -34,7 +34,8 @@ Windows 本机读取 / 驱动 Gello Dynamixel 主臂，经 **Thor / Jetson** 上
 | 定点关节角 | GUI 输入 J1..J7，经代理插值下发 |
 | 从臂模式 | `position`（位置跟随）/ `impedance`（关节阻抗） |
 | 统一频率 | GUI 设置 `frequency_hz`，同步上位机跟随环与代理插值环 |
-| 力反馈 | 手动 Nm，或从臂 `joint_ext × 增益` 映射到主臂电流力矩模式 |
+| 力反馈 | 手动 `J×增益`，或从臂 `joint_ext × 增益` 映射到主臂电流力矩模式 |
+| 主臂锁力 | 扩展位置模式开力矩，锁住当前姿（抗重力）；「松开主臂」关力矩可手掰 |
 | 日志 | 每次启动覆盖写入 `log/teleop_gui.log` |
 
 ---
@@ -97,13 +98,13 @@ GUI「启动/探测 Thor 代理」也可经 SSH 自动同步并后台拉起（�
 
 | 字段 | 含义 | 示例 |
 |------|------|------|
-| `thor.host` | Thor IP | `192.168.139.105` |
+| `thor.host` | Thor IP | `172.20.10.4` |
 | `thor.agent_port` | 代理端口 | `15666` |
 | `tianji.robot_ip` | 天机柜 IP（仅 Thor 可达） | `192.168.1.190` |
 | `tianji.control_mode` | `position` / `impedance` | `impedance` |
 | `control.frequency_hz` | 控制频率（本机+代理） | `100` |
 | `dynamixel.joint_signs` | 轴方向 | J2/J6 常为 `-1` |
-| `control.force_gains` | 从臂外力→主臂增益 | 见下节 |
+| `control.force_gains` | 手动/从臂外力→主臂增益 | 见下节 |
 
 **安全**：上传/分享前请把 `ssh_pass` 换成占位符；勿提交真实 token / 密码。
 
@@ -137,12 +138,13 @@ GUI「启动/探测 Thor 代理」也可经 SSH 自动同步并后台拉起（�
 
 | 力源 | 行为 |
 |------|------|
-| 手动输入 | 直接按 J1..J7 力矩下发 |
+| 手动输入 | `τ ≈ ±gain × J1..J7`（与从臂共用 G1..G7） |
 | 从臂外力(joint_ext) | `τ ≈ ±gain × joint_ext`（需从臂关节阻抗） |
 
 - **反馈时间 s**：到点自动停；`0` = 直到手动停止。
+- **透明/提示**：`|joint_ext|`（或手动非零力矩）低于死区时主臂**关力矩**保持丝滑；超过死区才开电流回力。退出阈值≈死区×`force_exit_deadband_ratio`（默认 0.6）。
 - 可与 **主控从** 并行（从臂外力模式）；与 **从控主** 互斥。
-- 限幅建议 ≤ `0.8 Nm`（XC330 接近上限；J2/XM430 可略高）。
+- 限幅建议 ≤ `0.8 Nm`（XC330 接近上限；J1/J2 的 XM430 可略高）。
 
 **推荐增益起点**（再按手感微调）：
 
@@ -173,6 +175,7 @@ q_raw = deg2rad(q_tianji) / joint_signs + joint_offsets_rad
 
 ```text
 τ_master = τ_cmd * joint_signs
+# 手动输入：τ_cmd = (±) force_gains[i] * J[i]          （再缩放/限幅）
 # 从臂外力：τ_cmd = (±) force_gains[i] * joint_ext[i]  （再缩放/限幅）
 ```
 

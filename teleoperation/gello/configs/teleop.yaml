@@ -1,32 +1,75 @@
 name: gello_leader_tianji_teleop
 dynamixel:
   baudrate: 1000000
-  global_ids: [1, 2, 3, 4, 5, 6, 7]
+  global_ids:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
   ports:
-    COM9: [1, 2, 3, 4, 5, 6, 7]
+    COM9:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
   servo_types:
-    1: XC330_T288_T
+    1: XM430_W210_T
     2: XM430_W210_T
     3: XC330_T288_T
     4: XC330_T288_T
     5: XC330_T288_T
     6: XC330_T288_T
     7: XC330_T288_T
-  # 请在本机标定后由 GUI「当前姿设为零位」写入
-  joint_offsets_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-  # J2/J6 常见反向
-  joint_signs: [1.0, -1.0, 1.0, 1.0, 1.0, -1.0, 1.0]
+  joint_offsets_rad:
+  - 2.2288740847978366
+  - 4.983903579840448
+  - 4.09266074207889
+  - 3.2673790781964156
+  - -4.75073850008183
+  - 3.0035343826800855
+  - 5.711010473298242
+  joint_signs:
+  - 1.0
+  - -1.0
+  - 1.0
+  - 1.0
+  - 1.0
+  - -1.0
+  - 1.0
 tianji:
   arm: A
   robot_ip: 192.168.1.190
   vel_ratio: 20
   acc_ratio: 20
-  # position | impedance
   control_mode: impedance
-  joint_k: [5.0, 5.0, 5.0, 4.0, 3.0, 3.0, 2.0]
-  joint_d: [0.3, 0.3, 0.3, 0.2, 0.2, 0.2, 0.2]
+  gripper:
+    type: jodell
+    channel: 2
+    slave_id: 1
+  joint_k:
+  - 5.0
+  - 5.0
+  - 5.0
+  - 4.0
+  - 3.0
+  - 3.0
+  - 2.0
+  joint_d:
+  - 0.3
+  - 0.3
+  - 0.3
+  - 0.2
+  - 0.2
+  - 0.2
+  - 0.2
 thor:
-  host: 192.168.139.105
+  host: 172.20.10.4
   agent_port: 15666
   ssh_user: YOUR_SSH_USER
   ssh_pass: YOUR_SSH_PASSWORD
@@ -44,6 +87,21 @@ control:
   force_scale: 1.0
   force_duration_s: 3.0
   force_source: manual
-  force_gains: [0.10, 0.08, 0.10, 0.12, 0.15, 0.15, 0.18]
+  force_gains:
+  - 0.1
+  - 0.08
+  - 0.1
+  - 0.12
+  - 0.15
+  - 0.15
+  - 0.18
   force_deadband_nm: 0.3
+  force_exit_deadband_ratio: 0.6
+  force_haptic_min_hold_s: 0.08
   force_invert: true
+button_serial:
+  enable: true
+  port: COM10
+  baudrate: 115200
+  trigger: S1
+  gripper_trigger: S2

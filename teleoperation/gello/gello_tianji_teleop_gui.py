@@ -5,6 +5,13 @@ Gello ↔ 天机 关节角遥操作 GUI
 两种互斥模式：
   - 主控从：本机读 COM9 Dynamixel，经 Thor 代理 set_joints 控制天机
   - 从控主：经 Thor get_state 读天机角，逆标定后写回 Gello 主臂位置
+权限交接（切方向不松力矩，需再点「开始跟随」）：
+  - 主控从中按 S1 锁住 → 改从控主 → 开始跟随：主臂开着力矩跟踪从臂（不是关力矩）
+  - 改回主控从：主臂自动锁住 → 开始跟随（从臂冻结）→ 再按 S1 接手手掰
+另支持测试模式：GUI 滑条拖动标定关节角(°)，实时平滑驱动 Gello 主臂
+主臂锁力：扩展位置模式下开力矩，把当前姿固定住（抗重力）；松开后可自由手掰
+黄键(ADKeyboard S1)：COM10 收到 S1 时切换锁/松，无弹窗；从控主实控中忽略
+绿键(ADKeyboard S2)：切换当前臂从臂夹爪夹紧/松开（需已连天机柜）
 
 用法:
   conda activate new_gello
@@ -35,7 +42,7 @@ from gello_leader.agent_client import (  # noqa: E402
 )
 from gello_leader.dynamixel.driver import (  # noqa: E402
     CURRENT_CONTROL_MODE,
-    POSITION_CONTROL_MODE,
+    EXTENDED_POSITION_CONTROL_MODE,
 )
 from gello_leader.dynamixel.multi_port_driver import (  # noqa: E402
     MultiPortDynamixelDriver,
@@ -147,12 +154,23 @@ class TeleopApp:
             self.joint_k.append(3.0)
         while len(self.joint_d) < 7:
             self.joint_d.append(0.2)
+        grip = tj.get("gripper") or {}
+        self.gripper_type = str(grip.get("type", "jodell")).strip().lower() or "jodell"
+        self.gripper_channel = int(grip.get("channel", 2))
+        self.gripper_slave = int(grip.get("slave_id", 1))
+        self._gripper_closed = False
 
         thor = self.cfg.get("thor", {})
-        self.thor_host = str(thor.get("host", "192.168.139.105"))
+        self.thor_host = str(thor.get("host", "172.20.10.4"))
         self.agent_port = int(thor.get("agent_port", 15666))
-        self.ssh_user = str(thor.get("ssh_user", "lambda2"))
-        self.ssh_pass = str(thor.get("ssh_pass", "lambda"))
+        ssh_user = str(thor.get("ssh_user", "lambda2")).strip()
+        ssh_pass = str(thor.get("ssh_pass", "lambda"))
+        if not ssh_user or ssh_user.upper().startswith("YOUR_SSH"):
+            ssh_user = "lambda2"
+        if not ssh_pass or ssh_pass.upper().startswith("YOUR_SSH"):
+            ssh_pass = "lambda"
+        self.ssh_user = ssh_user
+        self.ssh_pass = ssh_pass
         self.auto_start = bool(thor.get("auto_start_agent", True))
 
         self.dry_run = tk.BooleanVar(value=bool(ctrl.get("dry_run_default", True)))
@@ -163,6 +181,23 @@ class TeleopApp:
         self._stop_follow = threading.Event()
         self._follow_thread: Optional[threading.Thread] = None
         self._master_drive_enabled = False
+        self._master_hold_locked = False  # 位置保持锁住（抗重力）；从控主跟踪时为 False 但力矩仍开
+        self._slave_hold_frozen = threading.Event()
+        self._frozen_slave_cmd: List[float] = [0.0] * 7
+        btn = self.cfg.get("button_serial", {})
+        self._btn_serial_enable = bool(btn.get("enable", False))
+        self._btn_serial_port = str(btn.get("port", "COM10"))
+        self._btn_serial_baud = int(btn.get("baudrate", 115200))
+        self._btn_serial_trigger = str(btn.get("trigger", "S1")).strip()
+        self._btn_gripper_trigger = str(btn.get("gripper_trigger", "S2")).strip()
+        self._btn_last_gripper_t = 0.0
+        self._stop_btn_serial = threading.Event()
+        self._btn_serial_thread: Optional[threading.Thread] = None
+        self._btn_last_toggle_t = 0.0
+        self._master_test_running = False
+        self._stop_master_test = threading.Event()
+        self._master_test_thread: Optional[threading.Thread] = None
+        self._master_slider_guard = False
         self._force_fb_enabled = False
         self._stop_force_fb = threading.Event()
         self._force_fb_thread: Optional[threading.Thread] = None
@@ -182,9 +217,20 @@ class TeleopApp:
             self.force_gains.append(DEFAULT_FORCE_GAINS[len(self.force_gains)])
         self.force_deadband_nm = float(ctrl.get("force_deadband_nm", 0.3))
         self.force_invert = bool(ctrl.get("force_invert", True))
+        # 力反馈透明/提示切换：死区内关力矩，超死区再电流回力
+        self._force_exit_ratio = float(ctrl.get("force_exit_deadband_ratio", 0.6))
+        self._force_exit_ratio = max(0.05, min(self._force_exit_ratio, 0.95))
+        self._force_haptic_min_hold_s = float(
+            ctrl.get("force_haptic_min_hold_s", 0.08)
+        )
+        self._force_haptic_min_hold_s = max(0.0, min(self._force_haptic_min_hold_s, 1.0))
+        self._force_haptic_active = False
+        self._force_haptic_since = 0.0
+        self._force_current_prepared = False
         self._force_cmd_cache = [0.0] * 7
         self._force_cache_lock = threading.Lock()
         self._last_slave_ext = [0.0] * 7
+        self._last_manual_j = [0.0] * 7  # 手动框=外力等效，死区判据用 |J|
         self.force_source_var = tk.StringVar(
             value=FORCE_SRC_LABELS.get(self.force_source, "手动输入")
         )
@@ -196,6 +242,8 @@ class TeleopApp:
         self.root.after(100, self._ui_tick)
         self._on_direction_changed(initial=True)
         self.log(f"日志文件 → {LOG_FILE}（每次启动覆盖）")
+        if self._btn_serial_enable:
+            self._start_button_serial()
 
     # ---- UI ----
 
@@ -268,6 +316,34 @@ class TeleopApp:
             side="left", padx=2
         )
 
+        hold_row = ttk.Frame(conn)
+        hold_row.pack(fill="x", pady=(6, 0))
+        ttk.Button(
+            hold_row, text="锁住主臂", command=self.lock_master_hold
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            hold_row, text="松开主臂", command=self.unlock_master_hold
+        ).pack(side="left", padx=2)
+        self.master_hold_status_var = tk.StringVar(value="主臂锁力: 关")
+        ttk.Label(hold_row, textvariable=self.master_hold_status_var).pack(
+            side="left", padx=8
+        )
+        self.btn_serial_status_var = tk.StringVar(value="按键COM10: 未连接")
+        ttk.Label(hold_row, textvariable=self.btn_serial_status_var).pack(
+            side="left", padx=8
+        )
+        ttk.Button(
+            hold_row, text="从臂夹爪开合", command=self.toggle_slave_gripper
+        ).pack(side="left", padx=8)
+        self.gripper_status_var = tk.StringVar(value="夹爪: 开")
+        ttk.Label(hold_row, textvariable=self.gripper_status_var).pack(
+            side="left", padx=4
+        )
+        ttk.Label(
+            hold_row,
+            text="锁住=开力矩保持；松开=关力矩可手掰；S1锁/松；S2夹爪；切方向不松力矩",
+        ).pack(side="left", padx=4)
+
         row2 = ttk.Frame(conn)
         row2.pack(fill="x", pady=(6, 0))
         ttk.Label(row2, text="臂").pack(side="left")
@@ -277,6 +353,9 @@ class TeleopApp:
         ).pack(side="left", padx=4)
         ttk.Button(row2, text="使能", command=self.enable_arm).pack(side="left", padx=2)
         ttk.Button(row2, text="下使能", command=self.disable_arm).pack(
+            side="left", padx=2
+        )
+        ttk.Button(row2, text="清错", command=self.clear_arm_error).pack(
             side="left", padx=2
         )
         ttk.Button(row2, text="同步天机反馈→限速基准", command=self.sync_from_slave).pack(
@@ -319,6 +398,10 @@ class TeleopApp:
             variable=self.direction,
             command=self._on_direction_changed,
         ).pack(side="left", padx=4)
+        ttk.Label(
+            dir_row,
+            text="交接: 主控从 S1锁住→改从控主→开始跟随；改回主控从自动锁→开始跟随→S1接手",
+        ).pack(side="left", padx=8)
 
         btn_row = ttk.Frame(ctrl)
         btn_row.pack(fill="x", pady=(6, 0))
@@ -391,9 +474,89 @@ class TeleopApp:
             fj_btn, text="需先：连接代理→连接柜→使能；跟随中会先自动停止"
         ).pack(side="left", padx=4)
 
+        # ---- 测试模式：滑条拖动 → 主臂（本机 Dynamixel，无需天机）----
+        mtest = ttk.LabelFrame(
+            page,
+            text="测试模式 → 主臂 (拖动滑条改变标定角°，实时平滑驱动 Gello)",
+            padding=8,
+        )
+        mtest.pack(fill="x", padx=8, pady=4)
+
+        self.master_test_vars: List[tk.DoubleVar] = []
+        self.master_test_scales: List[tk.Scale] = []
+        self.master_test_val_labels: List[ttk.Label] = []
+        self._master_slider_guard = False  # 程序写滑条时忽略回调副作用
+        for i in range(7):
+            lo, hi = JOINT_LIMITS_DEG[i]
+            row = ttk.Frame(mtest)
+            row.pack(fill="x", pady=1)
+            ttk.Label(row, text=f"J{i+1}", width=3).pack(side="left")
+            ttk.Label(row, text=f"{lo:.0f}", width=5).pack(side="left")
+            mv = tk.DoubleVar(value=0.0)
+            self.master_test_vars.append(mv)
+            sc = tk.Scale(
+                row,
+                from_=lo,
+                to=hi,
+                orient=tk.HORIZONTAL,
+                resolution=0.1,
+                variable=mv,
+                length=420,
+                showvalue=0,
+                command=lambda _v, idx=i: self._on_master_slider_changed(idx),
+            )
+            sc.pack(side="left", fill="x", expand=True, padx=4)
+            self.master_test_scales.append(sc)
+            vl = ttk.Label(row, text="0.0°", width=8)
+            vl.pack(side="left")
+            self.master_test_val_labels.append(vl)
+            ttk.Label(row, text=f"{hi:.0f}", width=5).pack(side="left")
+
+        mt_btn = ttk.Frame(mtest)
+        mt_btn.pack(fill="x", pady=(6, 0))
+        ttk.Label(mt_btn, text="vmax°/s").pack(side="left")
+        self.master_test_vmax_var = tk.StringVar(value=f"{self.max_vel_deg_s:.0f}")
+        ttk.Entry(mt_btn, textvariable=self.master_test_vmax_var, width=6).pack(
+            side="left", padx=4
+        )
+        ttk.Label(mt_btn, text="amax°/s²").pack(side="left", padx=(6, 0))
+        self.master_test_amax_var = tk.StringVar(value=f"{self.max_acc_deg_s2:.0f}")
+        ttk.Entry(mt_btn, textvariable=self.master_test_amax_var, width=6).pack(
+            side="left", padx=4
+        )
+        ttk.Label(mt_btn, text="单步上限°").pack(side="left", padx=(6, 0))
+        self.master_test_step_var = tk.StringVar(value=f"{self.max_step:.1f}")
+        ttk.Entry(mt_btn, textvariable=self.master_test_step_var, width=5).pack(
+            side="left", padx=4
+        )
+        ttk.Button(
+            mt_btn, text="同步滑条←主臂", command=self.fill_master_test_from_master
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            mt_btn, text="滑条归零", command=self.fill_master_test_zeros
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            mt_btn, text="启用滑条控制", command=self.start_master_test_move
+        ).pack(side="left", padx=8)
+        ttk.Button(
+            mt_btn, text="停止控制", command=self.stop_master_test_move
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            mt_btn, text="松主臂力矩", command=self.release_master_test_hold
+        ).pack(side="left", padx=2)
+        self.master_test_status_var = tk.StringVar(value="主臂测试: 空闲")
+        ttk.Label(mt_btn, textvariable=self.master_test_status_var).pack(
+            side="left", padx=8
+        )
+        ttk.Label(
+            mtest,
+            text="先「同步滑条←主臂」再「启用滑条控制」，拖动滑条即实时平滑跟随；"
+            "vmax/amax 限速；停止后可松力矩；与跟随/力反馈互斥",
+        ).pack(anchor="w", pady=(4, 0))
+
         # ---- 力反馈到主臂（电流力矩模式）----
         forcef = ttk.LabelFrame(
-            page, text="力反馈 → 主臂 (手动Nm / 从臂joint_ext×增益)", padding=8
+            page, text="力反馈 → 主臂 (手动Nm×增益 / 从臂joint_ext×增益)", padding=8
         )
         forcef.pack(fill="x", padx=8, pady=4)
 
@@ -483,8 +646,8 @@ class TeleopApp:
         ttk.Label(ff_btn, textvariable=self.force_status_var).pack(side="left", padx=8)
         ttk.Label(
             forcef,
-            text="从臂外力模式：需连接柜并使能「关节阻抗」；tau=±gain×joint_ext→主臂电流模式；"
-            "可与主控从跟随并行；时间0=手动停",
+            text="力反馈：手动τ=G×J、从臂τ=G×ext；死区内松力矩(透明)，超死区电流回力(提示)；"
+            "从臂外力需连接柜+关节阻抗；可与主控从并行；时间0=手动停；改增益后需重新开始",
         ).pack(anchor="w", pady=(4, 0))
 
         table = ttk.LabelFrame(page, text="关节角 (°)", padding=8)
@@ -565,23 +728,41 @@ class TeleopApp:
     def _on_direction_changed(self, initial: bool = False) -> None:
         was_following = self.following and not initial
         if was_following:
-            self.stop_follow()
+            # 切方向只停环，主臂若已开力矩则抱住，绝不因换模式而软掉
+            self.stop_follow(release_master=False)
 
         if self.direction.get() == DIR_S2M:
             self.dry_run_cb.configure(text="干跑(不写主臂)")
             self.col_cmd_lbl.configure(text="天机反馈°")
-            if self.driver is not None and not self._master_drive_enabled:
-                # 从控主前保持松力矩，实控开始时再上力矩
-                pass
+            if (
+                not initial
+                and self.driver is not None
+                and not self._master_drive_enabled
+            ):
+                self.log(
+                    "提示: 主臂未锁。建议先按 S1 锁住再点「开始跟随」，"
+                    "避免开始跟踪时姿态跳变"
+                )
+            elif not initial and self._master_hold_locked:
+                self.log("主臂保持锁住；点「开始跟随」后将开力矩跟踪从臂（请先松手）")
         else:
             self.dry_run_cb.configure(text="干跑(不下发天机)")
             self.col_cmd_lbl.configure(text="标定目标°")
-            self._disable_master_drive(release_only=True)
+            if (
+                not initial
+                and self.driver is not None
+                and self._master_drive_enabled
+            ):
+                try:
+                    self._hold_master_pose()
+                    self.log("切回主控从: 主臂已锁住，点「开始跟随」后按 S1 再接手")
+                except Exception as e:
+                    self.log(f"切回主控从锁力失败: {e}")
 
         if not initial:
             self.log(f"控制方向 → {self._dir_label()}")
             if was_following:
-                self.log("切换方向已自动停止跟随")
+                self.log("切换方向已自动停止跟随（主臂不松力矩）")
 
     # ---- config / calib ----
 
@@ -676,6 +857,9 @@ class TeleopApp:
                 acc_ratio=int(self.acc_ratio),
                 joint_k=[float(x) for x in self.joint_k[:7]],
                 joint_d=[float(x) for x in self.joint_d[:7]],
+                gripper_type=self.gripper_type,
+                gripper_channel=int(self.gripper_channel),
+                gripper_slave=int(self.gripper_slave),
                 timeout=10.0,
             )
             self.log(f"已同步到 Jetson 代理: {r}")
@@ -744,6 +928,8 @@ class TeleopApp:
             if self.cfg.get("control", {}).get("disable_master_torque", True):
                 self.driver.set_torque_mode(False)
                 self._master_drive_enabled = False
+                self._master_hold_locked = False
+                self._set_master_hold_status(False)
                 self.log("主臂力矩已关闭")
             self.status_var.set("状态: 主臂已连接")
             self.log(f"主臂连接成功 ports={port_config} baud={baud}")
@@ -753,8 +939,9 @@ class TeleopApp:
             messagebox.showerror("主臂连接失败", str(e))
 
     def disconnect_master(self) -> None:
+        self.stop_master_test_move()
         self.stop_force_feedback()
-        self.stop_follow()
+        self.stop_follow(release_master=True)
         if self.driver is not None:
             try:
                 self.driver.set_torque_mode(False)
@@ -766,8 +953,287 @@ class TeleopApp:
                 self.log(f"关闭主臂异常: {e}")
             self.driver = None
             self._master_drive_enabled = False
+            self._master_hold_locked = False
+            self._set_master_hold_status(False)
             self.status_var.set("状态: 主臂已断开")
             self.log("主臂已断开")
+
+    def _set_master_hold_status(self, locked: bool) -> None:
+        if locked:
+            self.master_hold_status_var.set("主臂锁力: 开（位置保持）")
+        elif (
+            self.following
+            and self.direction.get() == DIR_S2M
+            and self._master_drive_enabled
+            and not self.dry_run.get()
+        ):
+            self.master_hold_status_var.set("主臂: 跟踪从臂")
+        else:
+            self.master_hold_status_var.set("主臂锁力: 关")
+
+    def lock_master_hold(self) -> None:
+        """当前位置进入扩展位置模式并开力矩，把主臂锁住（抗重力）。"""
+        if self.driver is None:
+            messagebox.showwarning("提示", "请先连接主臂")
+            return
+        if self._master_test_running:
+            messagebox.showwarning(
+                "提示", "滑条控制运行中，请先「停止控制」再锁住主臂"
+            )
+            return
+        if self._force_fb_enabled:
+            if not messagebox.askyesno(
+                "确认 · 锁力",
+                "力反馈运行中，锁力会先停止力反馈并改回位置保持。\n继续？",
+            ):
+                return
+            self.stop_force_feedback()
+            self.log("锁力前已停止力反馈")
+        if (
+            self.following
+            and self.direction.get() == DIR_S2M
+            and self._master_drive_enabled
+            and not self.dry_run.get()
+        ):
+            messagebox.showwarning(
+                "提示", "从控主跟踪中主臂已在跟随从臂，无需再锁"
+            )
+            return
+        elif self.following and self.direction.get() == DIR_M2S:
+            if not messagebox.askyesno(
+                "确认 · 锁力",
+                "主控从跟随中：锁力后主臂不能手掰，从臂会停在当前位置。\n"
+                "建议先停止跟随再锁。仍要锁住？",
+            ):
+                return
+
+        try:
+            self._enable_master_drive()
+            self._master_hold_locked = True
+            self._set_master_hold_status(True)
+            self.log("主臂锁力: 已在当前姿开力矩保持")
+            self._freeze_slave_if_m2s_following()
+        except Exception as e:
+            self._master_hold_locked = False
+            self._set_master_hold_status(False)
+            self.log(f"主臂锁力失败: {e}")
+            messagebox.showerror("主臂锁力", str(e))
+
+    def unlock_master_hold(self) -> None:
+        """关闭主臂力矩，恢复可手掰。"""
+        if self.driver is None:
+            messagebox.showwarning("提示", "请先连接主臂")
+            return
+        if self._master_test_running:
+            messagebox.showwarning(
+                "提示", "滑条控制运行中，请用「停止控制」/「松主臂力矩」"
+            )
+            return
+        if (
+            self.following
+            and self.direction.get() == DIR_S2M
+            and not self.dry_run.get()
+        ):
+            messagebox.showwarning(
+                "提示", "从控主跟踪中不能松力矩，请先改回主控从或「停止跟随」"
+            )
+            return
+        if self._force_fb_enabled and self._force_haptic_active:
+            messagebox.showwarning(
+                "提示", "力反馈提示态中，请先「停止力反馈」再松主臂"
+            )
+            return
+
+        was_locked = self._master_hold_locked or self._master_drive_enabled
+        self._clear_slave_hold_freeze()
+        self._disable_master_drive(release_only=False)
+        self._master_hold_locked = False
+        self._set_master_hold_status(False)
+        if was_locked:
+            self.log("主臂锁力: 已关力矩，可手掰")
+        else:
+            self.log("主臂锁力: 本已松开")
+
+    def _freeze_slave_at_master_pose(self) -> None:
+        """把从臂目标冻在当前主臂标定角，避免锁住后从臂继续跟手掰残差。"""
+        try:
+            cmd = self._read_cmd_deg()
+        except Exception:
+            cmd = list(self._last_cmd)
+        with self._lock:
+            self._frozen_slave_cmd = list(cmd)
+        self._last_cmd = list(cmd)
+        self._last_vel = [0.0] * 7
+        self._slave_hold_frozen.set()
+
+    def _freeze_slave_if_m2s_following(self) -> None:
+        if self.following and self.direction.get() == DIR_M2S:
+            self._freeze_slave_at_master_pose()
+
+    def _clear_slave_hold_freeze(self) -> None:
+        self._slave_hold_frozen.clear()
+
+    def _start_button_serial(self) -> None:
+        self._stop_btn_serial.clear()
+        self._btn_serial_thread = threading.Thread(
+            target=self._button_serial_loop, daemon=True
+        )
+        self._btn_serial_thread.start()
+        self.log(
+            f"黄键串口监听 {self._btn_serial_port} {self._btn_serial_baud} "
+            f"S1={self._btn_serial_trigger} S2={self._btn_gripper_trigger}"
+        )
+
+    def _stop_button_serial(self) -> None:
+        self._stop_btn_serial.set()
+        if self._btn_serial_thread and self._btn_serial_thread.is_alive():
+            self._btn_serial_thread.join(timeout=1.5)
+        self._btn_serial_thread = None
+
+    def _button_serial_loop(self) -> None:
+        try:
+            import serial
+        except Exception as e:
+            self.log(f"按键串口: 未安装 pyserial ({e})")
+            self.root.after(
+                0, lambda: self.btn_serial_status_var.set("按键COM10: 无pyserial")
+            )
+            return
+        port = self._btn_serial_port
+        baud = self._btn_serial_baud
+        trigger = self._btn_serial_trigger
+        grip_trig = self._btn_gripper_trigger
+        while not self._stop_btn_serial.is_set():
+            ser = None
+            try:
+                ser = serial.Serial(port, baud, timeout=0.2)
+                self.root.after(
+                    0,
+                    lambda p=port: self.btn_serial_status_var.set(f"按键{p}: 已连接"),
+                )
+                self.log(f"按键串口已打开 {port}")
+                while not self._stop_btn_serial.is_set():
+                    raw = ser.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                    if line == trigger:
+                        self.root.after(0, self._on_yellow_s1)
+                    elif grip_trig and line == grip_trig:
+                        self.root.after(0, self._on_green_s2)
+                    elif line.startswith("PRESS "):
+                        self.log(f"按键 {line}")
+            except Exception as e:
+                self.root.after(
+                    0,
+                    lambda: self.btn_serial_status_var.set(
+                        f"按键{port}: 未连接"
+                    ),
+                )
+                if not self._stop_btn_serial.is_set():
+                    self.log(f"按键串口等待 {port}: {e}")
+                for _ in range(20):
+                    if self._stop_btn_serial.is_set():
+                        break
+                    time.sleep(0.1)
+            finally:
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+
+    def _on_yellow_s1(self) -> None:
+        now = time.monotonic()
+        if now - self._btn_last_toggle_t < 0.25:
+            return
+        self._btn_last_toggle_t = now
+        if self._master_hold_locked:
+            self._unlock_master_hold_from_button()
+        else:
+            self._lock_master_hold_from_button()
+
+    def _lock_master_hold_from_button(self) -> None:
+        if self.driver is None:
+            self.log("黄键S1: 请先连接主臂")
+            return
+        if self._master_test_running:
+            self.log("黄键S1: 滑条控制中，忽略")
+            return
+        if (
+            self.following
+            and self.direction.get() == DIR_S2M
+            and not self.dry_run.get()
+        ):
+            self.log("黄键S1: 从控主跟踪中忽略锁力")
+            return
+        if self._force_fb_enabled:
+            self.stop_force_feedback()
+            self.log("黄键S1: 已停力反馈")
+        try:
+            self._enable_master_drive()
+            self._master_hold_locked = True
+            self._set_master_hold_status(True)
+            self._freeze_slave_if_m2s_following()
+            self.log("黄键S1: 主臂已锁住")
+        except Exception as e:
+            self._master_hold_locked = False
+            self._set_master_hold_status(False)
+            self.log(f"黄键S1: 锁力失败 {e}")
+
+    def _unlock_master_hold_from_button(self) -> None:
+        if self.driver is None:
+            self.log("黄键S1: 请先连接主臂")
+            return
+        if self._master_test_running:
+            self.log("黄键S1: 滑条控制中，忽略松开")
+            return
+        if (
+            self.following
+            and self.direction.get() == DIR_S2M
+            and not self.dry_run.get()
+        ):
+            self.log("黄键S1: 从控主跟踪中不能松力矩")
+            return
+        if self._force_fb_enabled and self._force_haptic_active:
+            self.log("黄键S1: 力反馈提示态中，忽略松开")
+            return
+        self._clear_slave_hold_freeze()
+        self._disable_master_drive(release_only=False)
+        self._master_hold_locked = False
+        self._set_master_hold_status(False)
+        self.log("黄键S1: 主臂已松开")
+
+    def _on_green_s2(self) -> None:
+        now = time.monotonic()
+        if now - self._btn_last_gripper_t < 0.35:
+            return
+        self._btn_last_gripper_t = now
+        self.toggle_slave_gripper()
+
+    def toggle_slave_gripper(self) -> None:
+        if not self.client or not self.client.connected:
+            self.log("绿键S2: 请先连接 Thor 代理和天机柜")
+            return
+        arm = self.arm_var.get().upper()
+        want_closed = not self._gripper_closed
+        try:
+            r = self.client.call(
+                "set_gripper",
+                arm=arm,
+                closed=want_closed,
+                timeout=8.0,
+            )
+        except Exception as e:
+            self.log(f"绿键S2: 夹爪指令失败 {e}")
+            return
+        if not r.get("ok"):
+            self.log(f"绿键S2: {r.get('msg', '夹爪失败')}")
+            return
+        self._gripper_closed = bool(r.get("closed", want_closed))
+        state = "夹紧" if self._gripper_closed else "松开"
+        self.gripper_status_var.set(f"夹爪: {state}")
+        self.log(f"绿键S2: {r.get('msg', state)}")
 
     def start_agent(self) -> None:
         def _run():
@@ -777,6 +1243,7 @@ class TeleopApp:
                 self.ssh_user,
                 self.ssh_pass,
                 self.log,
+                force_restart=True,
             )
             if not ok:
                 self.log("请手动在 Thor 启动 thor_joint_agent.py")
@@ -792,6 +1259,7 @@ class TeleopApp:
                     self.ssh_user,
                     self.ssh_pass,
                     self.log,
+                    force_restart=False,
                 )
             c = AgentClient(self.thor_host, self.agent_port, timeout=5.0)
             c.connect()
@@ -813,8 +1281,13 @@ class TeleopApp:
             return
         try:
             # 经 Thor 代理跳连天机柜( eth1 → robot_ip )，SDK 建链可能较慢
-            self.log(f"经 Thor 连接天机柜 {self.robot_ip} ...")
-            r = self.client.call("connect", ip=self.robot_ip, timeout=30.0)
+            self.log(f"经 Thor 连接天机柜 {self.robot_ip} (臂 {self.arm_var.get().upper()}) ...")
+            r = self.client.call(
+                "connect",
+                ip=self.robot_ip,
+                arm=self.arm_var.get().upper(),
+                timeout=30.0,
+            )
             self.log(f"连接柜: {r}")
             if not r.get("ok"):
                 messagebox.showerror("天机柜", r.get("msg", "失败"))
@@ -853,6 +1326,27 @@ class TeleopApp:
         except Exception as e:
             self.log(f"使能失败: {e}")
             messagebox.showerror("使能", str(e))
+
+    def clear_arm_error(self) -> None:
+        if not self.client or not self.client.connected:
+            messagebox.showwarning("提示", "请先连接代理和天机柜")
+            return
+        arm = self.arm_var.get().upper()
+        try:
+            self.log(f"清错 {arm} ...")
+            r = self.client.call("clear_error", arm=arm, timeout=15.0)
+            self.log(f"清错 {arm}: {r}")
+            if not r.get("ok"):
+                messagebox.showwarning(
+                    "清错",
+                    (r.get("msg") or "清错后故障仍在")
+                    + "\n请确认急停已松开、A 臂已上电，然后再点一次清错。",
+                )
+            else:
+                self.status_var.set(f"状态: {arm} 已清错")
+        except Exception as e:
+            self.log(f"清错失败: {e}")
+            messagebox.showerror("清错", str(e))
 
     def disable_arm(self) -> None:
         if not self.client or not self.client.connected:
@@ -1013,6 +1507,211 @@ class TeleopApp:
 
         threading.Thread(target=_run, daemon=True).start()
 
+    # ---- 测试模式：滑条拖动 → 主臂 ----
+
+    def _on_master_slider_changed(self, idx: int) -> None:
+        if self._master_slider_guard:
+            return
+        try:
+            v = float(self.master_test_vars[idx].get())
+        except (TypeError, ValueError, tk.TclError):
+            return
+        if 0 <= idx < len(self.master_test_val_labels):
+            self.master_test_val_labels[idx].configure(text=f"{v:.1f}°")
+
+    def _set_master_slider_deg(self, values: Sequence[float]) -> None:
+        """程序写入滑条位置（不触发突跳写舵机）。"""
+        clamped = clamp_tianji_deg(values, JOINT_LIMITS_DEG)
+        self._master_slider_guard = True
+        try:
+            for i, v in enumerate(clamped):
+                self.master_test_vars[i].set(round(float(v), 1))
+                self.master_test_val_labels[i].configure(text=f"{float(v):.1f}°")
+        finally:
+            self._master_slider_guard = False
+
+    def _read_master_test_joints_deg(self) -> List[float]:
+        vals: List[float] = []
+        for var in self.master_test_vars:
+            try:
+                vals.append(float(var.get()))
+            except (TypeError, ValueError, tk.TclError):
+                vals.append(0.0)
+        return clamp_tianji_deg(vals, JOINT_LIMITS_DEG)
+
+    def fill_master_test_zeros(self) -> None:
+        self._set_master_slider_deg([0.0] * 7)
+        self.log("主臂测试滑条已归零")
+
+    def fill_master_test_from_master(self) -> None:
+        if self.driver is None:
+            messagebox.showwarning("提示", "请先连接主臂")
+            return
+        try:
+            cmd = self._read_cmd_deg()
+            self._set_master_slider_deg(cmd)
+            self.log(
+                "主臂测试滑条 ← 当前标定目标: "
+                + ", ".join(f"{x:.2f}" for x in cmd)
+            )
+        except Exception as e:
+            self.log(f"读主臂标定目标失败: {e}")
+            messagebox.showerror("主臂测试", str(e))
+
+    def release_master_test_hold(self) -> None:
+        self.stop_master_test_move()
+        self._disable_master_drive()
+        self._master_hold_locked = False
+        self._set_master_hold_status(False)
+        self.master_test_status_var.set("主臂测试: 已松力矩")
+        self.log("主臂测试: 已关闭力矩")
+
+    def stop_master_test_move(self) -> None:
+        if not self._master_test_running:
+            return
+        self._stop_master_test.set()
+        self._master_test_running = False
+        if self._master_test_thread and self._master_test_thread.is_alive():
+            self._master_test_thread.join(timeout=1.5)
+        self._master_test_thread = None
+        # 停止后仍保持位置力矩（等同锁力），需点「松开主臂」或「松主臂力矩」
+        if self._master_drive_enabled:
+            self._master_hold_locked = True
+            self._set_master_hold_status(True)
+            self.master_test_status_var.set("主臂测试: 已停止(力矩保持)")
+            self.log("主臂滑条控制已停止（力矩仍开，等同锁力）")
+        else:
+            self.master_test_status_var.set("主臂测试: 已停止")
+            self.log("主臂滑条控制已停止")
+
+    def start_master_test_move(self) -> None:
+        """启用滑条实时控制：拖动滑条，主臂经 vmax/amax 平滑跟随。"""
+        if self.driver is None:
+            messagebox.showwarning("提示", "请先连接主臂")
+            return
+        if self._master_test_running:
+            messagebox.showwarning("提示", "滑条控制已在运行")
+            return
+        try:
+            step = float(self.master_test_step_var.get().strip() or str(self.max_step))
+            vmax = float(
+                self.master_test_vmax_var.get().strip() or str(self.max_vel_deg_s)
+            )
+            amax = float(
+                self.master_test_amax_var.get().strip() or str(self.max_acc_deg_s2)
+            )
+        except ValueError:
+            messagebox.showerror("主臂测试", "vmax / amax / 单步上限非法")
+            return
+        step = max(0.1, min(step, 30.0))
+        vmax = max(1.0, min(vmax, 360.0))
+        amax = max(1.0, min(amax, 5000.0))
+
+        if self.following:
+            self.stop_follow()
+            self.log("主臂测试前已停止跟随")
+        if self._force_fb_enabled:
+            self.stop_force_feedback()
+            self.log("主臂测试前已停止力反馈")
+
+        # 启用前对齐滑条；控制环用未钳位角，避免超限位时误跳到软限位边界
+        try:
+            start = self._read_cmd_deg(clamp=False)
+            self._set_master_slider_deg(start)  # 滑条显示仍钳在量程内
+        except Exception as e:
+            messagebox.showerror("主臂测试", f"无法读取主臂当前角: {e}")
+            return
+
+        if not messagebox.askyesno(
+            "确认 · 滑条控制",
+            "将启用滑条实时驱动 Gello 主臂（扩展位置模式）。\n"
+            f"vmax={vmax:.0f}°/s  amax={amax:.0f}°/s²  单步≤{step:.1f}°\n"
+            "拖动各关节滑条即可平滑改变角度。\n"
+            "请确认周围无干涉、急停可用。继续？",
+        ):
+            return
+
+        try:
+            self._enable_master_drive()
+            # 滑条驱动占用力矩态，不算用户「锁力」
+            self._master_hold_locked = False
+            self._set_master_hold_status(False)
+        except Exception as e:
+            self.log(f"主臂进入位置模式失败: {e}")
+            messagebox.showerror("主臂测试", str(e))
+            return
+
+        self._last_cmd = list(start)
+        self._last_vel = [0.0] * 7
+
+        self._stop_master_test.clear()
+        self._master_test_running = True
+        self.master_test_status_var.set("主臂测试: 滑条控制中")
+        self.status_var.set("状态: 主臂滑条控制中")
+        self.log(
+            f"主臂滑条控制已启用 | vmax={vmax:.0f} amax={amax:.0f} step≤{step:.1f}°"
+        )
+
+        period = 1.0 / max(1.0, self.freq_hz)
+
+        def _loop() -> None:
+            try:
+                while not self._stop_master_test.is_set():
+                    t0 = time.perf_counter()
+                    target = self._read_master_test_joints_deg()
+                    cmd, vel = trajectory_smooth(
+                        target,
+                        self._last_cmd,
+                        self._last_vel,
+                        period,
+                        vmax,
+                        amax,
+                    )
+                    cmd = rate_limit(cmd, self._last_cmd, step)
+                    for i in range(7):
+                        actual = cmd[i] - self._last_cmd[i]
+                        if abs(actual) < 1e-12:
+                            vel[i] = 0.0
+                        elif abs(vel[i] * period) > abs(actual) + 1e-9:
+                            vel[i] = actual / period
+                    self._last_cmd = list(cmd)
+                    self._last_vel = list(vel)
+
+                    q_cmd_rad = np.deg2rad(np.asarray(cmd, dtype=float))
+                    raw = invert_calibration(q_cmd_rad, self.offsets, self.signs)
+                    if self.driver is None:
+                        raise RuntimeError("主臂已断开")
+                    measured = self.driver.get_joints()
+                    with self._lock:
+                        self._last_raw = np.asarray(measured, dtype=float).copy()
+                    if self._master_drive_enabled:
+                        self.driver.set_joints(raw.tolist())
+
+                    dt = time.perf_counter() - t0
+                    time.sleep(max(0.0, period - dt))
+            except Exception as e:
+                self.log(f"主臂滑条控制错误: {e}")
+
+                def _err(msg: str = str(e)) -> None:
+                    self.master_test_status_var.set("主臂测试: 错误")
+                    messagebox.showerror("主臂测试", msg)
+
+                self.root.after(0, _err)
+            finally:
+                self._master_test_running = False
+                self._master_test_thread = None
+
+                def _done() -> None:
+                    if self._stop_master_test.is_set():
+                        self.master_test_status_var.set("主臂测试: 已停止")
+                    else:
+                        self.master_test_status_var.set("主臂测试: 结束")
+
+                self.root.after(0, _done)
+
+        self._master_test_thread = threading.Thread(target=_loop, daemon=True)
+        self._master_test_thread.start()
+
     # ---- 力反馈 → 主臂 ----
 
     def _force_source_key(self) -> str:
@@ -1136,18 +1835,19 @@ class TeleopApp:
                 ext, gains, scale, self.force_deadband_nm
             )
         else:
-            vals = []
+            # 手动 J1..J7 与 joint_ext 同语义：先按死区置零，再 τ=(±)G×J×缩放
+            raw: List[float] = []
             for i, var in enumerate(self.force_vars):
                 try:
-                    v = float(var.get().strip()) * scale
+                    raw.append(float(var.get().strip()))
                 except ValueError:
                     if not silent:
-                        messagebox.showerror("力反馈", f"J{i+1} 力矩不是合法数字")
+                        messagebox.showerror("力反馈", f"J{i+1} 不是合法数字")
                     return None
-                if self.force_invert_var.get():
-                    v = -v
-                v = max(-self.max_force_nm, min(self.max_force_nm, v))
-                vals.append(v)
+            self._last_manual_j = list(raw)
+            vals = self._slave_ext_to_cmd(
+                raw, gains, scale, self.force_deadband_nm
+            )
 
         with self._force_cache_lock:
             self._force_cmd_cache = list(vals)
@@ -1164,13 +1864,84 @@ class TeleopApp:
             out.append(float(forces_cmd[i]) * s)
         return out
 
+    def _force_decision_ext(self, src: str) -> List[float]:
+        """死区判决用的外力向量：从臂=joint_ext，手动=J1..J7。"""
+        if src == FORCE_SRC_SLAVE:
+            return list(self._last_slave_ext)
+        return list(self._last_manual_j)
+
+    def _force_metric_max(self, ext: Sequence[float]) -> float:
+        """对 |joint_ext| 或手动 |J| 取最大绝对值。"""
+        if not ext:
+            return 0.0
+        return max(abs(float(x)) for x in ext[:7])
+
+    def _force_want_haptic(self, _src: str, ext: Sequence[float]) -> bool:
+        """滞回判决是否进入提示(开力矩)。
+
+        从臂外力与手动输入语义相同：均对 |外力|（joint_ext 或 J）
+        使用死区 / 死区×ratio（默认进入 0.3 Nm，退出约 0.18 Nm）。
+        """
+        metric = self._force_metric_max(ext)
+        enter_thr = max(0.0, float(self.force_deadband_nm))
+        exit_thr = enter_thr * float(self._force_exit_ratio)
+        if enter_thr <= 1e-12:
+            enter_thr = 1e-6
+            exit_thr = 1e-9
+        now = time.perf_counter()
+        if self._force_haptic_active:
+            if (now - self._force_haptic_since) < self._force_haptic_min_hold_s:
+                return True
+            return metric >= exit_thr
+        return metric >= enter_thr
+
+    def _prepare_master_current_idle(self) -> None:
+        """切到电流模式但关力矩：力反馈武装、透明待命。"""
+        assert self.driver is not None
+        self.driver.set_torque_mode(False)
+        self.driver.set_operating_mode(CURRENT_CONTROL_MODE)
+        self._master_drive_enabled = False
+        self._master_hold_locked = False
+        self._set_master_hold_status(False)
+        self._force_haptic_active = False
+        self._force_current_prepared = True
+        self.log("主臂已进电流模式待命（力矩关 / 透明）")
+
     def _enter_master_current_mode(self) -> None:
+        """电流模式并开力矩（单次下发或立即进入提示态）。"""
         assert self.driver is not None
         self.driver.set_torque_mode(False)
         self.driver.set_operating_mode(CURRENT_CONTROL_MODE)
         self.driver.set_torque_mode(True)
-        self._master_drive_enabled = False  # 非位置驱动
+        self._master_drive_enabled = False
+        self._master_hold_locked = False
+        self._set_master_hold_status(False)
+        self._force_haptic_active = True
+        self._force_haptic_since = time.perf_counter()
+        self._force_current_prepared = True
         self.log("主臂已进入电流力矩模式并开启力矩")
+
+    def _set_master_haptic(self, active: bool, forces_cmd: Sequence[float]) -> None:
+        """透明↔提示：提示时开力矩并下发；透明时清零并关力矩（保持电流模式）。"""
+        assert self.driver is not None
+        if not self._force_current_prepared:
+            self._prepare_master_current_idle()
+        if active:
+            if not self._force_haptic_active:
+                self.driver.set_torque_mode(True)
+                self._force_haptic_active = True
+                self._force_haptic_since = time.perf_counter()
+                self.log("力反馈: 透明→提示（开力矩）")
+            self._apply_master_torques(forces_cmd)
+        else:
+            if self._force_haptic_active:
+                try:
+                    self.driver.set_torque([0.0] * 7)
+                except Exception:
+                    pass
+                self.driver.set_torque_mode(False)
+                self._force_haptic_active = False
+                self.log("力反馈: 提示→透明（关力矩）")
 
     def _apply_master_torques(self, forces_cmd: Sequence[float]) -> None:
         assert self.driver is not None
@@ -1191,14 +1962,21 @@ class TeleopApp:
         try:
             if self.following and self.direction.get() == DIR_S2M:
                 self.stop_follow()
-            if not self._force_fb_enabled:
-                self._enter_master_current_mode()
-            self._apply_master_torques(forces)
+            src = self._force_source_key()
+            want = self._force_want_haptic(src, self._force_decision_ext(src))
+            if want:
+                if not self._force_fb_enabled or not self._force_haptic_active:
+                    self._enter_master_current_mode()
+                self._apply_master_torques(forces)
+                self.force_status_var.set("力反馈: 已单次下发(提示)")
+            else:
+                self._prepare_master_current_idle()
+                self.force_status_var.set("力反馈: 单次跳过(透明/死区内)")
             self.log(
-                f"力反馈单次({FORCE_SRC_LABELS[self.force_source]}) Nm: "
+                f"力反馈单次({FORCE_SRC_LABELS[self.force_source]}) "
+                f"{'提示' if want else '透明'} Nm: "
                 + ", ".join(f"{x:.3f}" for x in forces)
             )
-            self.force_status_var.set("力反馈: 已单次下发")
         except Exception as e:
             self.log(f"力反馈下发失败: {e}")
             messagebox.showerror("力反馈", str(e))
@@ -1209,6 +1987,9 @@ class TeleopApp:
             return
         if self._force_fb_enabled:
             return
+        if self._master_test_running:
+            self.stop_master_test_move()
+            self.log("开始力反馈前已停止主臂测试")
         src = self._force_source_key()
         if src == FORCE_SRC_SLAVE:
             if not self.client or not self.client.connected:
@@ -1241,21 +2022,31 @@ class TeleopApp:
         elif self.following and src == FORCE_SRC_MANUAL:
             self.stop_follow()
             self.log("手动力反馈开始前已停止跟随")
-        dur_txt = "手动停止前一直输出" if duration_s <= 0 else f"{duration_s:.1f} s 后自动停止"
+        dur_txt = "手动停止前一直监视" if duration_s <= 0 else f"{duration_s:.1f} s 后自动停止"
+        exit_db = self.force_deadband_nm * self._force_exit_ratio
         if not messagebox.askyesno(
             "确认 · 力反馈",
             f"力源: {FORCE_SRC_LABELS[src]}\n"
-            "主臂将进入电流模式并输出力矩。\n"
+            "死区内主臂松力矩(透明)；超过死区才开电流回力(提示)。\n"
             f"限幅 ±{self.max_force_nm:.2f} Nm，缩放 {self.force_scale:.2f}\n"
             f"增益: {', '.join(f'{g:.2f}' for g in self.force_gains)}\n"
-            f"取反={self.force_invert_var.get()} 死区={self.force_deadband_nm:.2f}Nm\n"
+            f"取反={self.force_invert_var.get()} "
+            f"进入死区={self.force_deadband_nm:.2f}Nm "
+            f"退出≈{exit_db:.2f}Nm\n"
             f"反馈时间: {dur_txt}\n"
-            "请握稳主臂、周围无干涉。继续？",
+            "请确认周围无干涉。继续？",
         ):
             return
         try:
-            self._enter_master_current_mode()
-            self._apply_master_torques(forces)
+            # 以透明为起点做一次判决，避免沿用上次提示态
+            self._force_haptic_active = False
+            self._force_haptic_since = 0.0
+            want0 = self._force_want_haptic(src, self._force_decision_ext(src))
+            if want0:
+                self._enter_master_current_mode()
+                self._apply_master_torques(forces)
+            else:
+                self._prepare_master_current_idle()
         except Exception as e:
             self.log(f"力反馈启动失败: {e}")
             messagebox.showerror("力反馈", str(e))
@@ -1263,15 +2054,19 @@ class TeleopApp:
 
         self._stop_force_fb.clear()
         self._force_fb_enabled = True
+        init_state = "提示" if self._force_haptic_active else "透明"
         if duration_s > 0:
-            self.force_status_var.set(f"力反馈: 运行中 ({duration_s:.1f}s)")
+            self.force_status_var.set(
+                f"力反馈: {init_state} ({duration_s:.1f}s)"
+            )
         else:
-            self.force_status_var.set("力反馈: 运行中 (无时限)")
+            self.force_status_var.set(f"力反馈: {init_state} (无时限)")
         self.status_var.set("状态: 力反馈运行中")
         self.log(
-            f"开始力反馈({FORCE_SRC_LABELS[src]}) → 主臂 | "
+            f"开始力反馈({FORCE_SRC_LABELS[src]}) → 主臂 | 初始={init_state} | "
             + ", ".join(f"{x:.3f}" for x in forces)
             + f" | {self.freq_hz:.0f}Hz | duration={duration_s:.1f}s"
+            + f" | enter_db={self.force_deadband_nm:.2f} exit_db={exit_db:.2f}"
         )
 
         def _loop() -> None:
@@ -1288,33 +2083,120 @@ class TeleopApp:
                 t0 = time.perf_counter()
                 try:
                     if src == FORCE_SRC_SLAVE:
-                        cmd = self._compute_force_cmd_nm(silent=True)
-                        if cmd is None:
+                        # 提示态用更低死区算 τ，避免滞回带内命令被抹成全 0
+                        apply_db = (
+                            self.force_deadband_nm * self._force_exit_ratio
+                            if self._force_haptic_active
+                            else self.force_deadband_nm
+                        )
+                        try:
+                            scale = float(
+                                self.force_scale_var.get().strip() or "1"
+                            )
+                            lim = float(
+                                self.max_force_var.get().strip() or "0.8"
+                            )
+                            ui_db = float(
+                                self.force_deadband_var.get().strip() or "0"
+                            )
+                        except ValueError:
+                            scale = self.force_scale
+                            lim = self.max_force_nm
+                            ui_db = self.force_deadband_nm
+                        self.force_scale = scale
+                        self.max_force_nm = max(0.01, min(abs(lim), 3.0))
+                        self.force_deadband_nm = max(0.0, min(abs(ui_db), 20.0))
+                        gains = self._read_force_gains(silent=True)
+                        ext = None
+                        try:
+                            ext = self._fetch_slave_joint_ext(timeout=2.0)
+                        except Exception as e:
+                            self.log(f"读从臂外力失败: {e}")
+                        if ext is None:
                             with self._force_cache_lock:
                                 cmd = list(self._force_cmd_cache)
+                            ext = list(self._last_slave_ext)
+                        else:
+                            self._last_slave_ext = list(ext)
+                            if gains is None:
+                                with self._force_cache_lock:
+                                    cmd = list(self._force_cmd_cache)
+                            else:
+                                cmd = self._slave_ext_to_cmd(
+                                    ext, gains, scale, apply_db
+                                )
+                                with self._force_cache_lock:
+                                    self._force_cmd_cache = list(cmd)
                     else:
-                        with self._force_cache_lock:
-                            cmd = list(self._force_cmd_cache)
+                        # 手动：J 与 joint_ext 同语义；提示态用更低死区算 τ
+                        apply_db = (
+                            self.force_deadband_nm * self._force_exit_ratio
+                            if self._force_haptic_active
+                            else self.force_deadband_nm
+                        )
+                        try:
+                            scale = float(
+                                self.force_scale_var.get().strip() or "1"
+                            )
+                            lim = float(
+                                self.max_force_var.get().strip() or "0.8"
+                            )
+                            ui_db = float(
+                                self.force_deadband_var.get().strip() or "0"
+                            )
+                        except ValueError:
+                            scale = self.force_scale
+                            lim = self.max_force_nm
+                            ui_db = self.force_deadband_nm
+                        self.force_scale = scale
+                        self.max_force_nm = max(0.01, min(abs(lim), 3.0))
+                        self.force_deadband_nm = max(0.0, min(abs(ui_db), 20.0))
+                        gains = self._read_force_gains(silent=True)
+                        raw: List[float] = []
+                        ok_raw = True
+                        for i, var in enumerate(self.force_vars):
+                            try:
+                                raw.append(float(var.get().strip()))
+                            except ValueError:
+                                ok_raw = False
+                                break
+                        if not ok_raw or gains is None:
+                            with self._force_cache_lock:
+                                cmd = list(self._force_cmd_cache)
+                        else:
+                            self._last_manual_j = list(raw)
+                            cmd = self._slave_ext_to_cmd(
+                                raw, gains, scale, apply_db
+                            )
+                            with self._force_cache_lock:
+                                self._force_cmd_cache = list(cmd)
+
                     if self.driver is not None:
-                        self._apply_master_torques(cmd)
+                        want = self._force_want_haptic(
+                            src, self._force_decision_ext(src)
+                        )
+                        self._set_master_haptic(want, cmd)
+
                     now = time.perf_counter()
                     if now - last_status >= 0.25:
                         last_status = now
-                        ext = list(self._last_slave_ext)
+                        ext_ui = list(self._last_slave_ext)
                         remain = (
                             max(0.0, t_end - now) if t_end is not None else None
                         )
+                        haptic = self._force_haptic_active
 
-                        def _upd(e=ext, r=remain, s=src):
+                        def _upd(e=ext_ui, r=remain, h=haptic):
                             for i in range(7):
                                 self.slave_ext_vars[i].set(f"{e[i]:.2f}")
+                            st = "提示" if h else "透明"
                             if r is not None:
                                 self.force_status_var.set(
-                                    f"力反馈: 运行中 (剩余{r:.1f}s)"
+                                    f"力反馈: {st} (剩余{r:.1f}s)"
                                 )
-                            elif s == FORCE_SRC_SLAVE:
+                            else:
                                 self.force_status_var.set(
-                                    "力反馈: 从臂外力运行中"
+                                    f"力反馈: {st} (监视中)"
                                 )
 
                         self.root.after(0, _upd)
@@ -1337,6 +2219,8 @@ class TeleopApp:
                     self.driver.set_torque_mode(False)
                 except Exception:
                     pass
+            self._force_haptic_active = False
+            self._force_current_prepared = False
             self.force_status_var.set("力反馈: 关")
             return
         self._stop_force_fb.set()
@@ -1348,32 +2232,49 @@ class TeleopApp:
             try:
                 # 清零电流再松力矩
                 try:
-                    self.driver.set_torque([0.0] * 7)
+                    if self._force_haptic_active:
+                        self.driver.set_torque([0.0] * 7)
                 except Exception:
                     pass
                 self.driver.set_torque_mode(False)
             except Exception as e:
                 self.log(f"停止力反馈关力矩异常: {e}")
+        self._force_haptic_active = False
+        self._force_current_prepared = False
         self.force_status_var.set("力反馈: 关")
         self.log("已停止力反馈，主臂力矩已关")
 
     def _enable_master_drive(self) -> None:
         assert self.driver is not None
+        need_mode_switch = not self._master_drive_enabled
         if self._force_fb_enabled:
             self.stop_force_feedback()
+            need_mode_switch = True  # 力反馈停后在电流模式且力矩已关
         cur = np.asarray(self.driver.get_joints(), dtype=float).reshape(-1)
-        self.driver.set_torque_mode(False)
-        self.driver.set_operating_mode(POSITION_CONTROL_MODE)
-        self.driver.set_torque_mode(True)
+        if need_mode_switch:
+            self.driver.set_torque_mode(False)
+            # 扩展位置模式：Goal Position 可为负/跨圈，避免零点贴编码器 0 时负向拒收
+            self.driver.set_operating_mode(EXTENDED_POSITION_CONTROL_MODE)
+            self.driver.set_torque_mode(True)
+            self.log("主臂已进入扩展位置模式并开启力矩")
         self.driver.set_joints(cur.tolist())
         with self._lock:
             self._last_raw = cur.copy()
         self._master_drive_enabled = True
-        self.log("主臂已进入位置模式并开启力矩")
+
+    def _hold_master_pose(self) -> None:
+        """当前位置开力矩保持（不软掉）。已在位置模式则只刷新目标角。"""
+        if self.driver is None:
+            return
+        self._enable_master_drive()
+        self._master_hold_locked = True
+        self._set_master_hold_status(True)
 
     def _disable_master_drive(self, release_only: bool = False) -> None:
         if self.driver is None:
             self._master_drive_enabled = False
+            self._master_hold_locked = False
+            self._clear_slave_hold_freeze()
             return
         if not self._master_drive_enabled and release_only:
             return
@@ -1384,6 +2285,12 @@ class TeleopApp:
         except Exception as e:
             self.log(f"关闭主臂力矩异常: {e}")
         self._master_drive_enabled = False
+        if self._master_hold_locked:
+            self._master_hold_locked = False
+            self._set_master_hold_status(False)
+        else:
+            self._set_master_hold_status(False)
+        self._clear_slave_hold_freeze()
 
     # ---- follow loop ----
 
@@ -1393,6 +2300,9 @@ class TeleopApp:
             return
         if self.following:
             return
+        if self._master_test_running:
+            self.stop_master_test_move()
+            self.log("开始跟随前已停止主臂测试")
         if self._force_fb_enabled:
             # 从臂外力反馈可与主控从并行；手动力反馈/从控主需停力反馈
             if (
@@ -1404,6 +2314,7 @@ class TeleopApp:
 
         direction = self.direction.get()
         dry = self.dry_run.get()
+        keep_lock = False
 
         if direction == DIR_S2M:
             if not self.client or not self.client.connected:
@@ -1413,26 +2324,37 @@ class TeleopApp:
                 if not messagebox.askyesno(
                     "确认 · 从控主",
                     f"将以约 {self.freq_hz} Hz 用天机臂 {self.arm_var.get()} "
-                    "关节角驱动 Gello 主臂。\n"
-                    "请确认主从已对齐、主臂周围无干涉，急停可用。\n继续？",
+                    "关节角驱动 Gello 主臂（开着力矩跟踪，不是关力矩）。\n"
+                    "请先松手离开主臂，确认主从已对齐、周围无干涉，急停可用。\n继续？",
                 ):
                     return
                 try:
-                    self._enable_master_drive()
+                    if not self._master_drive_enabled:
+                        self._enable_master_drive()
+                    self._master_hold_locked = False
+                    self._clear_slave_hold_freeze()
                 except Exception as e:
                     self.log(f"主臂进入位置模式失败: {e}")
                     messagebox.showerror("主臂", str(e))
                     return
-            else:
-                self._disable_master_drive(release_only=True)
+            # 干跑不写主臂；若已锁住则保持锁力，避免软掉
         else:
-            # 主控从：确保主臂松力矩便于手掰
-            self._disable_master_drive(release_only=False)
-            if self.driver is not None:
+            keep_lock = bool(self._master_hold_locked or self._master_drive_enabled)
+            if keep_lock:
                 try:
-                    self.driver.set_torque_mode(False)
-                except Exception:
-                    pass
+                    self._hold_master_pose()
+                except Exception as e:
+                    self.log(f"主控从保持锁力失败: {e}")
+                    messagebox.showerror("主臂", str(e))
+                    return
+            else:
+                self._clear_slave_hold_freeze()
+                self._disable_master_drive(release_only=False)
+                if self.driver is not None:
+                    try:
+                        self.driver.set_torque_mode(False)
+                    except Exception:
+                        pass
             if not dry:
                 if not self.client or not self.client.connected:
                     messagebox.showwarning("提示", "非干跑需要先连接代理并使能")
@@ -1440,7 +2362,12 @@ class TeleopApp:
                 if not messagebox.askyesno(
                     "确认 · 主控从",
                     f"将以约 {self.freq_hz} Hz 向臂 {self.arm_var.get()} 下发关节角。\n"
-                    "请确认主从已对齐 Home，周围安全。\n继续？",
+                    + (
+                        "主臂当前锁住，从臂将停在对应姿态；按 S1 后再手掰。\n"
+                        if keep_lock
+                        else "请确认主从已对齐 Home，周围安全。\n"
+                    )
+                    + "继续？",
                 ):
                     return
 
@@ -1461,31 +2388,53 @@ class TeleopApp:
             else ""
         )
         self.status_var.set(f"状态: 跟随中 ({self._dir_label()} / {mode})")
-        self.log(f"开始跟随 ({self._dir_label()} / {mode}){smooth}")
+        extra = ""
+        if direction == DIR_S2M and not dry and self._master_drive_enabled:
+            self._set_master_hold_status(False)
+            extra = " | 主臂开力矩跟踪从臂"
+        elif direction == DIR_M2S and keep_lock:
+            self._freeze_slave_if_m2s_following()
+            extra = " | 主臂锁住，从臂冻结，S1接手"
+        self.log(f"开始跟随 ({self._dir_label()} / {mode}){smooth}{extra}")
 
-    def stop_follow(self) -> None:
+    def stop_follow(self, *, release_master: bool = False) -> None:
         if not self.following:
-            # 即使未跟随，从控主实控残留力矩也要松
-            if self._master_drive_enabled:
+            if release_master and self._master_drive_enabled:
                 self._disable_master_drive()
             return
         self._stop_follow.set()
         self.following = False
+        self._clear_slave_hold_freeze()
         if self._follow_thread and self._follow_thread.is_alive():
             self._follow_thread.join(timeout=1.5)
         self._follow_thread = None
-        if self.direction.get() == DIR_S2M or self._master_drive_enabled:
+        if release_master:
             self._disable_master_drive()
+            hold_note = ""
+        elif self._master_drive_enabled:
+            try:
+                self._hold_master_pose()
+                hold_note = "（主臂已锁住）"
+            except Exception as e:
+                self.log(f"停止跟随时锁力失败，改为松力矩: {e}")
+                self._disable_master_drive()
+                hold_note = ""
+        else:
+            hold_note = ""
         self.status_var.set("状态: 已停止跟随")
-        self.log("已停止跟随")
+        self.log("已停止跟随" + hold_note)
 
     def estop(self) -> None:
+        self.stop_master_test_move()
         self.stop_force_feedback()
-        self.stop_follow()
+        self.stop_follow(release_master=True)
         if self.driver is not None:
             try:
                 self.driver.set_torque_mode(False)
                 self._master_drive_enabled = False
+                self._master_hold_locked = False
+                self._set_master_hold_status(False)
+                self._clear_slave_hold_freeze()
                 self.log("急停: 主臂力矩已关")
             except Exception as e:
                 self.log(f"急停关主臂力矩失败: {e}")
@@ -1498,47 +2447,60 @@ class TeleopApp:
         self.status_var.set("状态: 急停")
         self.force_status_var.set("力反馈: 关")
 
-    def _read_cmd_deg(self) -> List[float]:
+    def _read_cmd_deg(self, *, clamp: bool = True) -> List[float]:
+        """读主臂并换算为标定角(°)。clamp=True 时按天机软限位截断（下发用）。"""
         assert self.driver is not None
         raw = self.driver.get_joints()
         with self._lock:
             self._last_raw = np.asarray(raw, dtype=float).copy()
         q = apply_calibration(raw, self.offsets, self.signs)
-        return to_tianji_deg(q, JOINT_LIMITS_DEG)
+        if clamp:
+            return to_tianji_deg(q, JOINT_LIMITS_DEG)
+        return [float(x) for x in np.rad2deg(q).reshape(-1).tolist()[:7]]
 
     def _follow_loop_master_to_slave(self) -> None:
         period = 1.0 / max(1.0, self.freq_hz)
         while not self._stop_follow.is_set():
             t0 = time.perf_counter()
             try:
-                target = self._read_cmd_deg()
-                if self.smooth_enable:
-                    cmd, vel = trajectory_smooth(
-                        target,
-                        self._last_cmd,
-                        self._last_vel,
-                        period,
-                        self.max_vel_deg_s,
-                        self.max_acc_deg_s2,
-                    )
-                    # 硬限幅兜底；若被截断则按实际步长回写速度状态
-                    cmd = rate_limit(cmd, self._last_cmd, self.max_step)
-                    for i in range(7):
-                        actual = cmd[i] - self._last_cmd[i]
-                        if abs(actual) < 1e-12:
-                            vel[i] = 0.0
-                        elif abs(vel[i] * period) > abs(actual) + 1e-9:
-                            vel[i] = actual / period
-                    self._last_vel = vel
+                if self._slave_hold_frozen.is_set():
+                    with self._lock:
+                        cmd = list(self._frozen_slave_cmd or self._last_cmd)
+                    self._last_cmd = list(cmd)
+                    if not self.dry_run.get() and self.client and self.client.connected:
+                        arm = self.arm_var.get().upper()
+                        self.client.call(
+                            "set_joints", arm=arm, joints=cmd, interp_s=0.0
+                        )
                 else:
-                    cmd = rate_limit(target, self._last_cmd, self.max_step)
-                    self._last_vel = [0.0] * 7
-                self._last_cmd = list(cmd)
-                if not self.dry_run.get() and self.client and self.client.connected:
-                    arm = self.arm_var.get().upper()
-                    self.client.call(
-                        "set_joints", arm=arm, joints=cmd, interp_s=0.0
-                    )
+                    target = self._read_cmd_deg()
+                    if self.smooth_enable:
+                        cmd, vel = trajectory_smooth(
+                            target,
+                            self._last_cmd,
+                            self._last_vel,
+                            period,
+                            self.max_vel_deg_s,
+                            self.max_acc_deg_s2,
+                        )
+                        # 硬限幅兜底；若被截断则按实际步长回写速度状态
+                        cmd = rate_limit(cmd, self._last_cmd, self.max_step)
+                        for i in range(7):
+                            actual = cmd[i] - self._last_cmd[i]
+                            if abs(actual) < 1e-12:
+                                vel[i] = 0.0
+                            elif abs(vel[i] * period) > abs(actual) + 1e-9:
+                                vel[i] = actual / period
+                        self._last_vel = vel
+                    else:
+                        cmd = rate_limit(target, self._last_cmd, self.max_step)
+                        self._last_vel = [0.0] * 7
+                    self._last_cmd = list(cmd)
+                    if not self.dry_run.get() and self.client and self.client.connected:
+                        arm = self.arm_var.get().upper()
+                        self.client.call(
+                            "set_joints", arm=arm, joints=cmd, interp_s=0.0
+                        )
             except Exception as e:
                 self.log(f"跟随环错误(主→从): {e}")
                 time.sleep(0.2)
@@ -1581,7 +2543,8 @@ class TeleopApp:
             if self.driver is not None:
                 if not self.following:
                     if self.direction.get() == DIR_M2S:
-                        cmd = self._read_cmd_deg()
+                        # 监控列显示真实标定角，超软限位不截断，避免“卡在 ±limit”
+                        cmd = self._read_cmd_deg(clamp=False)
                     else:
                         # 从控主空闲：读主臂，并尽量刷天机反馈到目标列
                         raw = self.driver.get_joints()
@@ -1614,8 +2577,9 @@ class TeleopApp:
         self.root.after(100, self._ui_tick)
 
     def on_close(self) -> None:
+        self._stop_button_serial()
         self.stop_force_feedback()
-        self.stop_follow()
+        self.stop_follow(release_master=True)
         self.disconnect_master()
         if self.client:
             try:

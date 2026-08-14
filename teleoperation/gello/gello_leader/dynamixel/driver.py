@@ -36,6 +36,8 @@ LEN_PRESENT_VELOCITY = 4
 ADDR_OPERATING_MODE = 11
 CURRENT_CONTROL_MODE = 0
 POSITION_CONTROL_MODE = 3
+# 允许负角度 / 跨 0–4095 圈边界（主臂位置驱动应使用此模式）
+EXTENDED_POSITION_CONTROL_MODE = 4
 
 # Servo-specific mappings and limits
 TORQUE_TO_CURRENT_MAPPING = {
@@ -316,34 +318,40 @@ class DynamixelDriver(DynamixelDriverProtocol):
             self._fake_joint_angles = np.array(joint_angles)
             return
 
-        for dxl_id, angle in zip(self._ids, joint_angles):
-            # Convert the angle to the appropriate value for the servo
-            position_value = int(angle * 2048 / np.pi)
+        # Must hold _lock: background sync-read thread otherwise races the bus
+        # and GroupSyncWrite param buffer (same pattern as set_current).
+        with self._lock:
+            try:
+                for dxl_id, angle in zip(self._ids, joint_angles):
+                    # ticks = rad * 2048/π；扩位模式需保留有符号 32-bit 编码
+                    position_value = int(angle * 2048 / np.pi) & 0xFFFFFFFF
 
-            # Allocate goal position value into byte array
-            param_goal_position = [
-                DXL_LOBYTE(DXL_LOWORD(position_value)),
-                DXL_HIBYTE(DXL_LOWORD(position_value)),
-                DXL_LOBYTE(DXL_HIWORD(position_value)),
-                DXL_HIBYTE(DXL_HIWORD(position_value)),
-            ]
+                    # Allocate goal position value into byte array
+                    param_goal_position = [
+                        DXL_LOBYTE(DXL_LOWORD(position_value)),
+                        DXL_HIBYTE(DXL_LOWORD(position_value)),
+                        DXL_LOBYTE(DXL_HIWORD(position_value)),
+                        DXL_HIBYTE(DXL_HIWORD(position_value)),
+                    ]
 
-            # Add goal position value to the Syncwrite parameter storage
-            dxl_addparam_result = self._groupSyncWrite.addParam(
-                dxl_id, param_goal_position
-            )
-            if not dxl_addparam_result:
-                raise RuntimeError(
-                    f"Failed to set joint angle for Dynamixel with ID {dxl_id}"
-                )
+                    # Add goal position value to the Syncwrite parameter storage
+                    dxl_addparam_result = self._groupSyncWrite.addParam(
+                        dxl_id, param_goal_position
+                    )
+                    if not dxl_addparam_result:
+                        raise RuntimeError(
+                            f"Failed to set joint angle for Dynamixel with ID {dxl_id}"
+                        )
 
-        # Syncwrite goal position
-        dxl_comm_result = self._groupSyncWrite.txPacket()
-        if dxl_comm_result != COMM_SUCCESS:
-            raise RuntimeError("Failed to syncwrite goal position")
-
-        # Clear syncwrite parameter storage
-        self._groupSyncWrite.clearParam()
+                # Syncwrite goal position
+                dxl_comm_result = self._groupSyncWrite.txPacket()
+                if dxl_comm_result != COMM_SUCCESS:
+                    raise RuntimeError(
+                        f"Failed to syncwrite goal position (comm={dxl_comm_result})"
+                    )
+            finally:
+                # Clear even on failure so next write can addParam again
+                self._groupSyncWrite.clearParam()
 
     def set_current(self, currents: Sequence[float]):
         if self._is_fake:

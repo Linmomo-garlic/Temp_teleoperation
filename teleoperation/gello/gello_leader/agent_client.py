@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
-DEFAULT_THOR_HOST = "192.168.139.105"
+DEFAULT_THOR_HOST = "172.20.10.4"
 DEFAULT_AGENT_PORT = 15666
 DEFAULT_SSH_USER = "lambda2"
 DEFAULT_SSH_PASS = "lambda"
@@ -18,6 +18,10 @@ AGENT_REMOTE = (
     "scripts/thor_joint_agent.py"
 )
 AGENT_CWD = "/home/lambda2/Desktop/lambda2_jetson_control/jetson_control"
+SESSION_REMOTE = (
+    "/home/lambda2/Desktop/lambda2_jetson_control/jetson_control/"
+    "tjfx_common/robot_session.py"
+)
 
 
 class AgentClient:
@@ -83,32 +87,36 @@ def ensure_agent_running(
     password: str,
     log: Callable[[str], None],
     local_agent_path: Optional[str] = None,
+    force_restart: bool = False,
 ) -> bool:
     """若代理未监听，则经 SSH 在 Thor 后台启动，并可同步本仓库 thor 脚本。"""
-    try:
-        c = AgentClient(host, port, timeout=2.0)
-        c.connect()
-        r = c.call("ping")
-        c.close()
-        if r.get("ok"):
-            log(f"代理已在线 {host}:{port}")
-            return True
-    except Exception:
-        pass
+    if not force_restart:
+        try:
+            c = AgentClient(host, port, timeout=2.0)
+            c.connect()
+            r = c.call("ping")
+            c.close()
+            if r.get("ok"):
+                log(f"代理已在线 {host}:{port}")
+                return True
+        except Exception:
+            pass
 
-    log(f"代理未监听，SSH 启动 {user}@{host} ...")
+    log(f"代理未监听，SSH 启动 {user}@{host} ..." if not force_restart else f"强制重启代理 {user}@{host} ...")
     try:
         import paramiko
     except ImportError:
         log("缺少 paramiko，请先手动在 Thor 启动代理")
         return False
 
+    here = os.path.dirname(os.path.abspath(__file__))
+    gello_root = os.path.dirname(here)
+    repo_root = os.path.dirname(os.path.dirname(gello_root))
     if local_agent_path is None:
-        local_agent_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "thor",
-            "thor_joint_agent.py",
-        )
+        local_agent_path = os.path.join(gello_root, "thor", "thor_joint_agent.py")
+    local_session_path = os.path.join(
+        repo_root, "jetson_control", "tjfx_common", "robot_session.py"
+    )
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -118,6 +126,9 @@ def ensure_agent_running(
         try:
             sftp.put(local_agent_path, AGENT_REMOTE)
             log(f"已同步代理脚本 → {AGENT_REMOTE}")
+            if os.path.isfile(local_session_path):
+                sftp.put(local_session_path, SESSION_REMOTE)
+                log(f"已同步会话封装 → {SESSION_REMOTE}")
         except Exception as e:
             log(f"同步脚本失败(将尝试用远端已有文件): {e}")
         finally:

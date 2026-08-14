@@ -15,6 +15,7 @@ SDK / eth1 → 192.168.1.190 只能从 Thor 访问，因此控制环必须在本
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import socket
@@ -67,6 +68,62 @@ KINE_CFG_NAME = "ccs_m6_40.MvKDCfg"
 
 DEFAULT_JOINT_K = [5.0, 5.0, 5.0, 4.0, 3.0, 3.0, 2.0]
 DEFAULT_JOINT_D = [0.3, 0.3, 0.3, 0.2, 0.2, 0.2, 0.2]
+# 末端 RS485：SDK channel 2 = COM1（夹爪默认走这路）
+GRIPPER_COM1_CHANNEL = 2
+
+
+def _modbus_crc(data: bytes) -> bytes:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return bytes((crc & 0xFF, (crc >> 8) & 0xFF))
+
+
+def _jodell_init_frame(slave: int) -> bytes:
+    """使能 rACT=1（写 0x03E8 = 0x0001）。"""
+    body = bytes([slave & 0xFF, 0x10, 0x03, 0xE8, 0x00, 0x01, 0x02, 0x00, 0x01])
+    return body + _modbus_crc(body)
+
+
+def _jodell_go_frame(slave: int, closed: bool) -> bytes:
+    """参数模式：rACT+rGTO，位置 0x00 开 / 0xFF 关，全速全力。"""
+    pos = 0xFF if closed else 0x00
+    body = bytes(
+        [
+            slave & 0xFF,
+            0x10,
+            0x03,
+            0xE8,
+            0x00,
+            0x03,
+            0x06,
+            0x00,
+            0x09,
+            pos,
+            0x00,
+            0xFF,
+            0xFF,
+        ]
+    )
+    return body + _modbus_crc(body)
+
+
+def _changingtek_init_frame(slave: int) -> bytes:
+    body = bytes([slave & 0xFF, 0x06, 0x01, 0x00, 0x00, 0x01])
+    return body + _modbus_crc(body)
+
+
+def _changingtek_go_frame(slave: int, closed: bool) -> bytes:
+    pos = 0 if closed else 1000
+    body = bytes(
+        [slave & 0xFF, 0x06, 0x01, 0x03, (pos >> 8) & 0xFF, pos & 0xFF]
+    )
+    return body + _modbus_crc(body)
 
 
 class DualArmAgent:
@@ -94,6 +151,11 @@ class DualArmAgent:
         self._kine = {"A": None, "B": None}
         self._kine_ready = False
         self._kine_msg = "未初始化"
+        self.gripper_closed: Dict[str, bool] = {"A": False, "B": False}
+        self._gripper_inited: Dict[str, bool] = {"A": False, "B": False}
+        self.gripper_type = "jodell"
+        self.gripper_channel = GRIPPER_COM1_CHANNEL
+        self.gripper_slave = 1
 
     def _ensure_session(self):
         from tjfx_common.robot_session import RobotSession
@@ -101,29 +163,122 @@ class DualArmAgent:
         if self.session is None:
             self.session = RobotSession()
 
-    def connect(self, ip: str) -> Dict[str, Any]:
+    def connect(self, ip: str, arm: str = "A") -> Dict[str, Any]:
+        arm = (arm or "A").upper()
+        require = ["A", "B"] if arm == "AB" else [arm]
         with self._lock:
             self._ensure_session()
-            ok = self.session.connect(ip)
+            try:
+                ok = self.session.connect(ip, require_arms=require)
+            except TypeError:
+                ok = self.session.connect(ip)
             self.robot_ip = ip
             self.enabled = {"A": False, "B": False}
+            self._gripper_inited = {"A": False, "B": False}
             if not ok:
-                return {"ok": False, "msg": f"连接失败: {ip}"}
+                detail = getattr(self.session, "last_error", None) or "未知原因"
+                if self._other_arm_fault(detail) and self._connect_marvin(ip, require):
+                    ok = True
+                    warn = getattr(self.session, "last_warning", None) or detail
+                else:
+                    print(f"[agent] connect failed {ip}: {detail}", flush=True)
+                    return {"ok": False, "msg": f"连接失败: {ip} ({detail})"}
+            else:
+                warn = getattr(self.session, "last_warning", None) or ""
             snap = self._snapshot()
-            for arm in ("A", "B"):
-                self.target[arm] = list(snap["arms"][arm]["joint_pos"])
-            kine_ok = self._init_kine()
-            for arm in ("A", "B"):
-                self._sync_xyzabc_from_joints(arm)
+            for a in ("A", "B"):
+                self.target[a] = list(snap["arms"][a]["joint_pos"])
+            kine_ok = self._init_kine(arm)
+            for a in require:
+                self._sync_xyzabc_from_joints(a)
+            msg = f"已连接 {ip} (只用{','.join(require)}); kine={'OK' if kine_ok else self._kine_msg}"
+            if warn:
+                msg += f"; 警告: {warn}"
+            print(f"[agent] {msg}", flush=True)
             return {
                 "ok": True,
-                "msg": f"已连接 {ip}; kine={'OK' if kine_ok else self._kine_msg}",
+                "msg": msg,
                 "kine_ready": self._kine_ready,
+                "warning": warn,
                 "state": snap,
             }
 
-    def _init_kine(self) -> bool:
-        """加载双臂运动学，供笛卡尔增量 IK。失败时 cart_delta 不可用。"""
+    @staticmethod
+    def _other_arm_fault(detail: str) -> bool:
+        text = detail or ""
+        return (
+            "柜可达" in text
+            or "手臂报错" in text
+            or "PDO" in text
+            or "返回 False" in text
+            or "柜无响应" in text
+        )
+
+    def _connect_marvin(self, ip: str, require: List[str]) -> bool:
+        """Concise 因另一臂报错拒绝时，改用 Marvin_Robot 只检查目标臂。"""
+        try:
+            from SDK_PYTHON.fx_robot import DCSS, Marvin_Robot
+        except Exception as e:
+            print(f"[agent] Marvin fallback import fail: {e}", flush=True)
+            return False
+        robot = None
+        try:
+            robot = Marvin_Robot()
+            if not robot.connect(ip):
+                try:
+                    robot.release_robot()
+                except Exception:
+                    pass
+                return False
+            dcss = DCSS()
+            sub = None
+            for _ in range(10):
+                sub = robot.subscribe(dcss)
+                if sub:
+                    break
+                time.sleep(0.02)
+            if not sub:
+                robot.release_robot()
+                return False
+            sess = self.session
+            if hasattr(sess, "_required_arms_ok"):
+                ok_req, note = sess._required_arms_ok(sub, require)
+                if not ok_req:
+                    robot.release_robot()
+                    print(f"[agent] Marvin fallback 目标臂不可用: {note}", flush=True)
+                    return False
+            else:
+                idx = 0 if require[0] == "A" else 1
+                err = int(sub["states"][idx].get("err_code", 0) or 0)
+                st = int(sub["states"][idx].get("cur_state", 0) or 0)
+                if err != 0 or st == 100:
+                    robot.release_robot()
+                    return False
+                note = ""
+            warn = note or "已忽略非目标臂故障"
+            if hasattr(sess, "_adopt"):
+                sess._adopt(robot, dcss, ip, warning=warn)
+            else:
+                sess.robot = robot
+                sess.dcss = dcss
+                sess.ip = ip
+                sess.connected = True
+                sess.last_error = None
+                sess.last_warning = warn
+            print(f"[agent] Marvin fallback 已连接 {ip} require={require}", flush=True)
+            return True
+        except Exception as e:
+            print(f"[agent] Marvin fallback fail: {e}", flush=True)
+            if robot is not None:
+                try:
+                    robot.release_robot()
+                except Exception:
+                    pass
+            return False
+
+    def _init_kine(self, arm: str = "AB") -> bool:
+        """加载运动学，供笛卡尔增量 IK。失败时 cart_delta 不可用。"""
+        wanted = ["A", "B"] if (arm or "AB").upper() == "AB" else [(arm or "A").upper()]
         try:
             import logging
 
@@ -138,14 +293,14 @@ class DualArmAgent:
                 print(f"[kine] {self._kine_msg}", flush=True)
                 return False
 
-            ok_all = True
-            for idx, arm in enumerate(("A", "B")):
+            for idx, a in enumerate(("A", "B")):
+                if a not in wanted:
+                    continue
                 kine = Marvin_Kine()
                 kine.log_switch(0)
                 ini = kine.load_config(arm_type=idx, config_path=cfg_path)
                 if not ini:
-                    ok_all = False
-                    self._kine[arm] = None
+                    self._kine[a] = None
                     continue
                 ok = kine.initial_kine(
                     robot_type=ini["TYPE"][idx],
@@ -154,12 +309,11 @@ class DualArmAgent:
                     j67=ini["BD"][idx],
                 )
                 if not ok:
-                    ok_all = False
-                    self._kine[arm] = None
+                    self._kine[a] = None
                 else:
-                    self._kine[arm] = kine
-                    print(f"[kine] {arm} OK TYPE={ini['TYPE'][idx]}", flush=True)
-            self._kine_ready = ok_all and all(self._kine[a] is not None for a in ("A", "B"))
+                    self._kine[a] = kine
+                    print(f"[kine] {a} OK TYPE={ini['TYPE'][idx]}", flush=True)
+            self._kine_ready = all(self._kine[a] is not None for a in wanted)
             self._kine_msg = "OK" if self._kine_ready else "部分/全部运动学初始化失败"
             return self._kine_ready
         except Exception as e:
@@ -248,7 +402,10 @@ class DualArmAgent:
             }
         arms = {}
         for arm in ("A", "B"):
-            d = self.session.snapshot_arm(sub, arm)
+            try:
+                d = self.session.snapshot_arm(sub, arm)
+            except Exception:
+                d = self._empty_arm(arm)
             pe = d.get("joint_pos_e") or d["joint_pos"]
             out = dict(d)
             # JSON 友好：列表化 + 圆整
@@ -371,6 +528,12 @@ class DualArmAgent:
                 while len(d) < 7:
                     d.append(DEFAULT_JOINT_D[len(d)])
                 self.joint_d = d
+            if req.get("gripper_type") is not None:
+                self.gripper_type = str(req["gripper_type"]).strip().lower() or "jodell"
+            if req.get("gripper_channel") is not None:
+                self.gripper_channel = int(req["gripper_channel"])
+            if req.get("gripper_slave") is not None:
+                self.gripper_slave = int(req["gripper_slave"])
             return {
                 "ok": True,
                 "msg": "params updated",
@@ -467,7 +630,7 @@ class DualArmAgent:
         r = self.session.robot
         try:
             if err0 != 0:
-                r.clear_error(arm)
+                self._sdk_clear_error(arm)
                 time.sleep(0.25)
         except Exception:
             pass
@@ -631,20 +794,51 @@ class DualArmAgent:
                 self.enabled[a] = False
             return {"ok": True, "msg": "软急停", "state": self._snapshot()}
 
+    def _sdk_clear_error(self, arm: str) -> None:
+        r = self.session.robot
+        if hasattr(self.session, "sdk_clear_error"):
+            self.session.sdk_clear_error(r, arm)
+            return
+        if hasattr(r, "clear_error"):
+            r.clear_error(arm)
+            return
+        raw = getattr(r, "robot", None)
+        fn = getattr(raw, f"OnClearErr_{arm.upper()}", None) if raw is not None else None
+        if callable(fn):
+            fn()
+            return
+        raise AttributeError("无清错接口")
+
     def clear_error(self, arm: str = "AB") -> Dict[str, Any]:
         arm = arm.upper()
         arms = ["A", "B"] if arm == "AB" else [arm]
         with self._lock:
             if not self.session or not self.session.connected:
                 return {"ok": False, "msg": "未连接"}
-            r = self.session.robot
+            msgs = []
             for a in arms:
                 try:
-                    r.clear_error(a)
-                except Exception:
-                    pass
-            time.sleep(0.2)
-            return {"ok": True, "msg": f"已清错 {arms}", "state": self._snapshot()}
+                    self._sdk_clear_error(a)
+                    msgs.append(f"{a}=ok")
+                except Exception as e:
+                    msgs.append(f"{a}={e}")
+            time.sleep(0.3)
+            snap = self._snapshot()
+            leftover = []
+            for a in arms:
+                err = int(snap["arms"][a].get("err_code", -1))
+                st = int(snap["arms"][a].get("cur_state", -1))
+                leftover.append(f"{a}: err={err} state={st}")
+            still_bad = any(
+                int(snap["arms"][a].get("err_code", -1) or 0) != 0
+                or int(snap["arms"][a].get("cur_state", -1)) == 100
+                for a in arms
+            )
+            return {
+                "ok": not still_bad,
+                "msg": f"清错 {', '.join(msgs)}; 现在 {'; '.join(leftover)}",
+                "state": snap,
+            }
 
     def _clamp_joints(self, joints: List[float]) -> List[float]:
         out = []
@@ -814,6 +1008,122 @@ class DualArmAgent:
                 "applied_dxyz_mm": [round(x, 3) for x in dxyz_mm[:3]],
             }
 
+    def _send_ch_data(self, arm: str, payload: bytes, channel: int) -> bool:
+        """经 SDK 末端通道发一帧（COM1=2）。优先 Python 封装，否则 ctypes OnSetChDataA/B。"""
+        if not payload:
+            return False
+        r = self.session.robot
+        raw = getattr(r, "robot", r)
+        suffix = "A" if arm == "A" else "B"
+        n = len(payload)
+        buf = (ctypes.c_ubyte * n)(*payload)
+
+        if hasattr(r, "set_ch_data"):
+            for args in (
+                (arm, payload, channel),
+                (arm, list(payload), channel),
+                (payload, n, channel),
+                (buf, n, channel),
+            ):
+                try:
+                    ok = r.set_ch_data(*args)
+                    if ok is None or bool(ok):
+                        return True
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+
+        clear = getattr(raw, f"OnClearChData{suffix}", None)
+        send = getattr(raw, f"OnSetChData{suffix}", None)
+        if send is None:
+            send = getattr(r, f"OnSetChData{suffix}", None)
+            clear = getattr(r, f"OnClearChData{suffix}", clear)
+        if send is None:
+            return False
+        if callable(clear):
+            try:
+                clear()
+            except Exception:
+                pass
+        try:
+            send.argtypes = [
+                ctypes.POINTER(ctypes.c_ubyte),
+                ctypes.c_long,
+                ctypes.c_long,
+            ]
+            send.restype = ctypes.c_bool
+        except Exception:
+            pass
+        try:
+            return bool(send(buf, n, int(channel)))
+        except Exception:
+            try:
+                return bool(send(bytes(payload), n, int(channel)))
+            except Exception as e:
+                print(f"[agent] OnSetChData{suffix} failed: {e}", flush=True)
+                return False
+
+    def set_gripper(self, arm: str, closed: Optional[bool] = None) -> Dict[str, Any]:
+        """切换或指定从臂夹爪开合。默认钧舵/Jodell Modbus，走末端 COM1。"""
+        arm = (arm or "A").upper()
+        if arm not in ("A", "B"):
+            return {"ok": False, "msg": f"无效臂 {arm}"}
+        with self._lock:
+            if not self.session or not self.session.connected:
+                return {"ok": False, "msg": "未连接天机柜"}
+            if closed is None:
+                closed = not self.gripper_closed.get(arm, False)
+            closed = bool(closed)
+            gtype = (self.gripper_type or "jodell").lower()
+            slave = int(self.gripper_slave or 1)
+            channel = int(self.gripper_channel or GRIPPER_COM1_CHANNEL)
+            r = self.session.robot
+
+            if hasattr(r, "set_gripper"):
+                try:
+                    pos = 0.0 if closed else 1.0
+                    ok = r.set_gripper(arm, pos)
+                    if ok is None or bool(ok):
+                        self.gripper_closed[arm] = closed
+                        return {
+                            "ok": True,
+                            "closed": closed,
+                            "msg": f"{arm} 夹爪{'夹紧' if closed else '松开'} (set_gripper)",
+                        }
+                except Exception as e:
+                    print(f"[agent] set_gripper SDK: {e}", flush=True)
+
+            if gtype in ("changingtek", "ag2f90", "ag95"):
+                frames = []
+                if not self._gripper_inited.get(arm):
+                    frames.append(_changingtek_init_frame(slave))
+                frames.append(_changingtek_go_frame(slave, closed))
+            else:
+                frames = []
+                if not self._gripper_inited.get(arm):
+                    frames.append(_jodell_init_frame(slave))
+                frames.append(_jodell_go_frame(slave, closed))
+
+            sent = 0
+            for i, frame in enumerate(frames):
+                if not self._send_ch_data(arm, frame, channel):
+                    return {
+                        "ok": False,
+                        "msg": f"{arm} 夹爪 RS485 发送失败 ({gtype} ch={channel})",
+                        "closed": self.gripper_closed.get(arm, False),
+                    }
+                sent += 1
+                if i + 1 < len(frames):
+                    time.sleep(0.08)
+            self._gripper_inited[arm] = True
+            self.gripper_closed[arm] = closed
+            return {
+                "ok": True,
+                "closed": closed,
+                "msg": f"{arm} 夹爪{'夹紧' if closed else '松开'} ({gtype} {sent}帧)",
+            }
+
     def handle(self, req: Dict[str, Any]) -> Dict[str, Any]:
         cmd = (req.get("cmd") or "").strip().lower()
         try:
@@ -828,7 +1138,10 @@ class DualArmAgent:
                     "max_step_deg": self.max_step_deg,
                 }
             if cmd == "connect":
-                return self.connect(req.get("ip") or DEFAULT_IP)
+                return self.connect(
+                    req.get("ip") or DEFAULT_IP,
+                    req.get("arm") or "A",
+                )
             if cmd == "disconnect":
                 return self.disconnect()
             if cmd == "get_state":
@@ -864,6 +1177,10 @@ class DualArmAgent:
                     req.get("dxyz_mm"),
                     req.get("drpy_deg"),
                 )
+            if cmd == "set_gripper":
+                closed = req.get("closed")
+                closed_b = None if closed is None else bool(closed)
+                return self.set_gripper(req.get("arm", "A"), closed_b)
             if cmd == "rpc":
                 return self.rpc(req.get("method") or "", req.get("args") or [])
             return {"ok": False, "msg": f"未知命令: {cmd}"}
